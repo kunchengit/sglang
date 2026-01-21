@@ -868,7 +868,6 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             # Alpha-MoE: interleave weights and scales for the kernel
             if get_moe_runner_backend().is_alpha_moe():
                 from sglang.srt.layers.moe.moe_runner.alpha_moe import (
-                    get_or_create_alpha_moe_config,
                     interleave_tensor,
                 )
 
@@ -882,14 +881,8 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                     requires_grad=False,
                 )
                 torch.cuda.empty_cache()
-
-                # Trigger autotuning at server startup
-                # This ensures autotuning happens during weight loading
-                E = layer.w13_weight.shape[0]  # num_experts
-                N = layer.w13_weight.shape[1]  # intermediate_size
-                K = layer.w13_weight.shape[2]  # hidden_size
-                top_k = getattr(layer, "top_k", 8)  # Default to 8 if not available
-                get_or_create_alpha_moe_config(E, N, K, top_k)
+                # NOTE: Autotuning is lazily triggered during the first kernel execution
+                # in AlphaMoeRunnerCore.run(), similar to DeepGEMM's JIT compilation pattern.
 
     def process_weights_after_loading(self, layer: Module) -> None:
         if _is_hip and _use_hip_int4:

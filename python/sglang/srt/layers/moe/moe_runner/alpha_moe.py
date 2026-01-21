@@ -38,6 +38,31 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 # ============================================================================
+# Global Configuration (similar to DeepGEMM's compile_utils.py pattern)
+# ============================================================================
+
+# Controls which rank runs autotuning. Similar to DeepGEMM's _IS_FIRST_RANK_ON_NODE.
+# - True: This rank should run autotuning (default for single GPU)
+# - False: This rank should wait and load from cache
+_IS_FIRST_RANK_ON_NODE = True
+
+
+def update_alpha_moe_config(gpu_id: int, server_args) -> None:
+    """
+    Update Alpha-MoE configuration based on server args.
+
+    This should be called during server initialization, similar to
+    DeepGEMM's update_deep_gemm_config().
+
+    Args:
+        gpu_id: The GPU ID for this process
+        server_args: Server arguments
+    """
+    global _IS_FIRST_RANK_ON_NODE
+    _IS_FIRST_RANK_ON_NODE = server_args.base_gpu_id == gpu_id
+
+
+# ============================================================================
 # Alpha-MoE Availability Check
 # ============================================================================
 
@@ -191,6 +216,7 @@ _ALPHA_MOE_CACHE_DIR = os.path.join(
     os.path.expanduser("~"), ".cache", "sglang", "alpha_moe"
 )
 _ALPHA_MOE_CONFIG_CACHE: Dict[str, dict] = {}
+_ALPHA_MOE_AUTOTUNING_DONE: Dict[str, bool] = {}  # Track if autotuning was already attempted
 
 
 def _get_config_cache_path(E: int, N: int, K: int) -> str:
@@ -218,11 +244,17 @@ def _get_default_config(num_tokens: int) -> dict:
     }
 
 
-def _run_autotuning(
+def run_autotuning(
     E: int, N: int, K: int, top_k: int, device: torch.device
-) -> Dict[str, dict]:
+) -> Optional[Dict[str, dict]]:
     """
     Run autotuning to find best configurations for different batch sizes.
+
+    This function follows DeepGEMM's lazy JIT compilation pattern:
+    - Only the first rank on the node (_IS_FIRST_RANK_ON_NODE) runs autotuning
+    - Other ranks load from the disk cache (created by the first rank or previous runs)
+    - No barrier synchronization is needed - other ranks will use default config
+      until the cache file is available
 
     Args:
         E: Number of experts
@@ -232,24 +264,64 @@ def _run_autotuning(
         device: CUDA device to run tuning on
 
     Returns:
-        Dictionary mapping batch_size -> config
+        Dictionary mapping batch_size -> config, or None if autotuning fails/skipped
     """
     from sglang.srt.layers.moe.fused_moe_triton.fused_moe import moe_align_block_size
     from sglang.srt.layers.quantization.fp8_kernel import per_token_group_quant_fp8
 
+    cache_path = _get_config_cache_path(E, N, K)
+    
+    # Check memory cache first (avoid repeated operations for each layer)
+    if cache_path in _ALPHA_MOE_CONFIG_CACHE:
+        return _ALPHA_MOE_CONFIG_CACHE[cache_path]
+    
+    # Check if we already attempted autotuning in this process
+    # This avoids repeated filesystem operations in the hot path
+    if cache_path in _ALPHA_MOE_AUTOTUNING_DONE:
+        return None
+    
+    _ALPHA_MOE_AUTOTUNING_DONE[cache_path] = True
+    
+    # Check if cache already exists (from previous run or another rank)
+    if os.path.exists(cache_path):
+        try:
+            with open(cache_path, "r") as f:
+                config = json.load(f)
+                _ALPHA_MOE_CONFIG_CACHE[cache_path] = config
+                logger.info(f"Loaded Alpha-MoE config from cache: {cache_path}")
+                return config
+        except Exception as e:
+            if not _IS_FIRST_RANK_ON_NODE:
+                # Non-first rank should not try to re-tune, just use default
+                logger.debug(f"Failed to load cache, will use default config: {e}")
+                return None
+            logger.warning(f"Cache corrupted, will re-tune: {e}")
+    
+    # Only first rank on node runs autotuning (similar to DeepGEMM pattern)
+    if not _IS_FIRST_RANK_ON_NODE:
+        logger.debug(
+            f"Alpha-MoE autotuning skipped (not first rank on node). "
+            f"Will use default config. Config will be cached by first rank."
+        )
+        return None
+    
+    # First rank on node: Run autotuning
+    os.makedirs(_ALPHA_MOE_CACHE_DIR, exist_ok=True)
+    
     logger.info(
         f"Running Alpha-MoE autotuning for E={E}, N={N}, K={K}, top_k={top_k}. "
         "This may take a few minutes on first run..."
     )
 
     block_shape = [128, 128]
-    batch_sizes = [8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192]
+    batch_sizes = [1, 8, 16, 32, 64, 128, 256, 512, 1024, 2048]
 
     # Create dummy weights for tuning
-    w1 = torch.randn((E, N, K), dtype=torch.float8_e4m3fn, device=device)
-    w2 = torch.randn((E, K, N // 2), dtype=torch.float8_e4m3fn, device=device)
+    # Note: torch.randn doesn't support FP8 dtype directly, must create and convert
+    w1 = torch.randn((E, N, K), device=device).to(torch.float8_e4m3fn)
+    w2 = torch.randn((E, K, N // 2), device=device).to(torch.float8_e4m3fn)
     w1_scale = (
-        torch.ones(
+        torch.randn(
             (E, N // block_shape[0], K // block_shape[1]),
             dtype=torch.float32,
             device=device,
@@ -257,13 +329,13 @@ def _run_autotuning(
         * 0.01
     )
     w2_scale = (
-        torch.ones(
-            (E, K // block_shape[0], (N // 2) // block_shape[1]),
-            dtype=torch.float32,
-            device=device,
+        torch.randn(
+                (E, K // block_shape[0], (N // 2) // block_shape[1]),
+                dtype=torch.float32,
+                device=device,
+            )
+            * 0.01
         )
-        * 0.01
-    )
 
     # Interleave w1 weights and scales
     w1_interleaved = interleave_tensor(w1, rep=8)
@@ -376,91 +448,29 @@ def _run_autotuning(
                 f"stages={best_config['stages']}, time={best_time:.3f}ms"
             )
         else:
-            # Fallback to default
-            config[str(num_tokens)] = _get_default_config(num_tokens)
+            # If we can't find any valid config for this batch size, skip it
+            # (will use default at runtime)
             logger.warning(
-                f"  Batch {num_tokens}: Using default config (tuning failed)"
+                f"Alpha-MoE autotuning failed for batch {num_tokens}, will use default config at runtime."
             )
 
     # Cleanup
     del w1, w2, w1_scale, w2_scale, w1_interleaved, w1_scale_interleaved
     torch.cuda.empty_cache()
 
-    return config
-
-
-def get_or_create_alpha_moe_config(
-    E: int, N: int, K: int, top_k: int, device: Optional[torch.device] = None
-) -> Dict[str, dict]:
-    """
-    Get Alpha-MoE configuration from cache, or run autotuning if not cached.
-
-    This function should be called during server startup (weight loading phase)
-    to ensure autotuning happens before inference. During inference, use
-    get_alpha_moe_config() instead which only loads from cache.
-
-    Args:
-        E: Number of experts
-        N: Intermediate size
-        K: Hidden size
-        top_k: Number of experts per token
-        device: CUDA device (defaults to current device)
-
-    Returns:
-        Configuration dictionary mapping batch_size -> {block_m, block_n, warp_n, stages}
-    """
-    cache_path = _get_config_cache_path(E, N, K)
-
-    # Try to load from cache
-    if cache_path in _ALPHA_MOE_CONFIG_CACHE:
-        return _ALPHA_MOE_CONFIG_CACHE[cache_path]
-
-    if os.path.exists(cache_path):
+    # Only save to cache if we found at least some valid configs
+    if config:
         try:
-            with open(cache_path, "r") as f:
-                config = json.load(f)
-                _ALPHA_MOE_CONFIG_CACHE[cache_path] = config
-                logger.info(f"Loaded Alpha-MoE config from cache: {cache_path}")
-                return config
+            with open(cache_path, "w") as f:
+                json.dump(config, f, indent=2)
+            logger.info(f"Saved Alpha-MoE config to cache: {cache_path}")
+            _ALPHA_MOE_CONFIG_CACHE[cache_path] = config
         except Exception as e:
-            logger.warning(f"Failed to load Alpha-MoE config from cache: {e}")
+            logger.warning(f"Failed to save Alpha-MoE config to cache: {e}")
+    else:
+        logger.warning(f"Alpha-MoE autotuning failed, no tuning results to cache.")
 
-    # Check if user provided a config via environment variable
-    user_config_path = os.environ.get("ALPHA_MOE_CONFIG")
-    if user_config_path and os.path.exists(user_config_path):
-        try:
-            with open(user_config_path, "r") as f:
-                config = json.load(f)
-                _ALPHA_MOE_CONFIG_CACHE[cache_path] = config
-                logger.info(f"Loaded Alpha-MoE config from user path: {user_config_path}")
-                return config
-        except Exception as e:
-            logger.warning(f"Failed to load Alpha-MoE config from user path: {e}")
-
-    # Run autotuning
-    if device is None:
-        device = torch.device("cuda")
-
-    try:
-        config = _run_autotuning(E, N, K, top_k, device)
-    except Exception as e:
-        logger.warning(f"Alpha-MoE autotuning failed: {e}. Using default config.")
-        # Create default config for common batch sizes
-        config = {}
-        for bs in [8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192]:
-            config[str(bs)] = _get_default_config(bs)
-
-    # Save to cache
-    try:
-        os.makedirs(_ALPHA_MOE_CACHE_DIR, exist_ok=True)
-        with open(cache_path, "w") as f:
-            json.dump(config, f, indent=2)
-        logger.info(f"Saved Alpha-MoE config to cache: {cache_path}")
-    except Exception as e:
-        logger.warning(f"Failed to save Alpha-MoE config to cache: {e}")
-
-    _ALPHA_MOE_CONFIG_CACHE[cache_path] = config
-    return config
+    return config if config else None
 
 
 def get_alpha_moe_config(E: int, N: int, K: int) -> Optional[Dict[str, dict]]:
@@ -480,11 +490,16 @@ def get_alpha_moe_config(E: int, N: int, K: int) -> Optional[Dict[str, dict]]:
     """
     cache_path = _get_config_cache_path(E, N, K)
 
-    # Check memory cache first
+    # Check memory cache first (fast path for hot loop)
     if cache_path in _ALPHA_MOE_CONFIG_CACHE:
         return _ALPHA_MOE_CONFIG_CACHE[cache_path]
 
-    # Try to load from disk cache
+    # Check if we already looked up this config and found nothing
+    # This avoids repeated filesystem operations in the hot path
+    if cache_path in _ALPHA_MOE_AUTOTUNING_DONE:
+        return None
+
+    # First time looking up this config - check disk cache
     if os.path.exists(cache_path):
         try:
             with open(cache_path, "r") as f:
@@ -505,6 +520,8 @@ def get_alpha_moe_config(E: int, N: int, K: int) -> Optional[Dict[str, dict]]:
         except Exception:
             pass
 
+    # Mark that we've looked up this config (to avoid repeated filesystem ops)
+    _ALPHA_MOE_AUTOTUNING_DONE[cache_path] = True
     return None
 
 
@@ -627,27 +644,47 @@ class AlphaMoeRunnerCore(MoeRunnerCore):
     def runner_backend(self) -> MoeRunnerBackend:
         return MoeRunnerBackend.ALPHA_MOE
 
-    def _ensure_tuning_config(self, quant_info: AlphaMoeQuantInfo) -> None:
+    def _ensure_tuning_config(
+        self, quant_info: AlphaMoeQuantInfo, device: torch.device
+    ) -> None:
         """
-        Ensure tuning configuration is loaded.
+        Ensure tuning configuration is loaded, triggering autotuning if needed.
 
-        This is a fallback for when config is not loaded during server startup.
-        It only attempts to load from cache - no autotuning at inference time.
-        If no config is found, uses default config (may be suboptimal).
+        This follows DeepGEMM's lazy JIT compilation pattern:
+        - On first kernel execution, attempt to load config from cache
+        - If no cache exists and this is the first rank on node, run autotuning
+        - Other ranks will use default config until cache file is available
+
+        Args:
+            quant_info: Quantization info with model dimensions
+            device: CUDA device to run autotuning on
         """
+        if self._tuning_config is not None:
+            return
+
+        E = quant_info.num_experts
+        N = quant_info.intermediate_size
+        K = quant_info.hidden_size
+        top_k = self.config.top_k
+
+        # Try to load from cache first
+        self._tuning_config = get_alpha_moe_config(E, N, K)
+
         if self._tuning_config is None:
-            # Try to load from cache (no autotuning at inference time)
-            self._tuning_config = get_alpha_moe_config(
-                E=quant_info.num_experts,
-                N=quant_info.intermediate_size,
-                K=quant_info.hidden_size,
-            )
+            # Cache not found - run autotuning (lazy JIT pattern)
+            # Only first rank on node will actually run autotuning
+            # Other ranks will get None and use default config
+            self._tuning_config = run_autotuning(E, N, K, top_k, device=device)
+
             if self._tuning_config is None:
-                logger.warning(
-                    "Alpha-MoE tuning config not found. Using default config which may "
-                    "be suboptimal. This usually means autotuning was skipped during "
-                    "weight loading. Run autotuning by restarting the server."
-                )
+                # Autotuning was skipped (not first rank) or failed
+                # Log warning for first rank (autotuning failed)
+                # Non-first rank silently uses default config (this is expected behavior)
+                if _IS_FIRST_RANK_ON_NODE:
+                    logger.warning(
+                        "Alpha-MoE autotuning failed. Using default config which may "
+                        "be suboptimal."
+                    )
 
     def run(
         self,
@@ -666,7 +703,8 @@ class AlphaMoeRunnerCore(MoeRunnerCore):
         Returns:
             AlphaMoeRunnerOutput with computed hidden states
         """
-        self._ensure_tuning_config(quant_info)
+        # Trigger lazy autotuning on first execution (similar to DeepGEMM pattern)
+        self._ensure_tuning_config(quant_info, device=runner_input.hidden_states.device)
 
         hidden_states = runner_input.hidden_states
         hidden_states_scale = runner_input.hidden_states_scale

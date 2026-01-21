@@ -425,9 +425,9 @@ class TestModuleExports(unittest.TestCase):
             get_alpha_moe_config,
             get_alpha_moe_import_error,
             get_best_config_for_tokens,
-            get_or_create_alpha_moe_config,
             interleave_tensor,
             is_alpha_moe_available,
+            run_autotuning,
         )
 
         # All should be importable (not necessarily callable if classes)
