@@ -227,32 +227,30 @@ def _get_config_cache_path(E: int, N: int, K: int) -> str:
 def _get_default_config(num_tokens: int) -> dict:
     """Get default conservative configuration when autotuning is not available."""
     # Conservative defaults that work reasonably well
-    if num_tokens <= 16:
-        block_m = 16
-    elif num_tokens <= 64:
-        block_m = 32
+    if num_tokens <= 64:
+        block_m = 8
     elif num_tokens <= 256:
-        block_m = 64
+        block_m = 16
     else:
-        block_m = 128
+        block_m = 32
 
     return {
         "block_m": block_m,
-        "block_n": 64,
-        "warp_n": 4,
-        "stages": 2,
+        "block_n": 32,
+        "warp_n": 8,
+        "stages": 3,
     }
 
 
 def run_autotuning(
     E: int, N: int, K: int, top_k: int, device: torch.device
-) -> None:
+) -> Optional[Dict[str, dict]]:
     """
     Run autotuning to find best configurations for different batch sizes.
 
     This function follows DeepGEMM's lazy JIT compilation pattern:
     - Only the first rank on the node (_IS_FIRST_RANK_ON_NODE) runs autotuning
-    - Other ranks should not call this function (handled by get_alpha_moe_config)
+    - Other ranks return None immediately
 
     Args:
         E: Number of experts
@@ -260,6 +258,9 @@ def run_autotuning(
         K: Hidden size
         top_k: Number of experts per token
         device: CUDA device to run tuning on
+
+    Returns:
+        Dictionary mapping batch_size -> config if successful, None otherwise
     """
     from sglang.srt.layers.moe.fused_moe_triton.fused_moe import moe_align_block_size
     from sglang.srt.layers.quantization.fp8_kernel import per_token_group_quant_fp8
@@ -272,7 +273,7 @@ def run_autotuning(
             f"Alpha-MoE autotuning skipped (not first rank on node). "
             f"Will use default config. Config will be cached by first rank."
         )
-        return
+        return None
     
     # First rank on node: Run autotuning
     os.makedirs(_ALPHA_MOE_CACHE_DIR, exist_ok=True)
@@ -283,7 +284,7 @@ def run_autotuning(
     )
 
     block_shape = [128, 128]
-    batch_sizes = [1, 8, 16, 32, 64, 128, 256, 512, 1024, 2048]
+    batch_sizes = [1, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096]
 
     # Create dummy weights for tuning
     # Note: torch.randn doesn't support FP8 dtype directly, must create and convert
@@ -436,8 +437,10 @@ def run_autotuning(
             _ALPHA_MOE_CONFIG_CACHE[cache_path] = config
         except Exception as e:
             logger.warning(f"Failed to save Alpha-MoE config to cache: {e}")
+        return config
     else:
         logger.warning(f"Alpha-MoE autotuning failed, will use default config.")
+        return None
 
 
 def get_alpha_moe_config(
@@ -476,6 +479,10 @@ def get_alpha_moe_config(
             with open(cache_path, "r") as f:
                 config = json.load(f)
                 _ALPHA_MOE_CONFIG_CACHE[cache_path] = config
+                if _IS_FIRST_RANK_ON_NODE:
+                    logger.info(f"Loaded Alpha-MoE config from disk cache: {cache_path}")
+                else:
+                    logger.debug(f"Loaded Alpha-MoE config from disk cache: {cache_path}")
                 return config
         except Exception:
             pass
@@ -487,6 +494,10 @@ def get_alpha_moe_config(
             with open(user_config_path, "r") as f:
                 config = json.load(f)
                 _ALPHA_MOE_CONFIG_CACHE[cache_path] = config
+                if _IS_FIRST_RANK_ON_NODE:
+                    logger.info(f"Loaded Alpha-MoE config from user config: {user_config_path}")
+                else:
+                    logger.debug(f"Loaded Alpha-MoE config from user config: {user_config_path}")
                 return config
         except Exception:
             pass
@@ -502,20 +513,9 @@ def get_alpha_moe_config(
     _ALPHA_MOE_AUTOTUNING_DONE[cache_path] = True
 
     if top_k > 0 and device is not None:
-        # run_autotuning has no return value, it just tunes and saves to cache
-        run_autotuning(E, N, K, top_k, device)
-
-        # Re-read from cache (autotuning may have succeeded and saved config)
-        if cache_path in _ALPHA_MOE_CONFIG_CACHE:
-            return _ALPHA_MOE_CONFIG_CACHE[cache_path]
-        if os.path.exists(cache_path):
-            try:
-                with open(cache_path, "r") as f:
-                    config = json.load(f)
-                    _ALPHA_MOE_CONFIG_CACHE[cache_path] = config
-                    return config
-            except Exception:
-                pass
+        # Run autotuning and return result (config or None)
+        config = run_autotuning(E, N, K, top_k, device)
+        return config
 
     # Autotuning failed or skipped, use default
     return None
