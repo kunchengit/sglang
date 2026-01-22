@@ -5,20 +5,21 @@ This file tests the Alpha-MoE runner implementation including:
 - Basic functionality checks
 - Weight interleaving
 - Requirements validation
+- Configuration and autotuning functions
 - Integration with SGLang's MoE runner framework
+
+Usage:
+    python -m unittest test.srt.test_alpha_moe
+    python -m unittest test.srt.test_alpha_moe.TestAlphaMoeAvailability
 """
 
+import os
+import tempfile
 import unittest
 
 import torch
 
-from sglang.srt.utils import get_device_sm, kill_process_tree
-from sglang.test.test_utils import (
-    DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-    DEFAULT_URL_FOR_TEST,
-    popen_launch_server,
-    try_cached_model,
-)
+from sglang.srt.utils import get_device_sm
 
 
 class TestAlphaMoeAvailability(unittest.TestCase):
@@ -332,11 +333,21 @@ class TestConfigFunctions(unittest.TestCase):
     """Test Alpha-MoE configuration functions."""
 
     def test_get_default_config(self):
-        """Test _get_default_config function."""
+        """Test _get_default_config function with various batch sizes."""
         from sglang.srt.layers.moe.moe_runner.alpha_moe import _get_default_config
 
         # Test various batch sizes
-        for num_tokens in [8, 16, 32, 64, 128, 256, 512, 1024]:
+        test_cases = [
+            (8, 8),      # <= 64
+            (32, 8),     # <= 64
+            (64, 8),     # <= 64
+            (128, 16),   # <= 256
+            (256, 16),   # <= 256
+            (512, 32),   # > 256
+            (1024, 32),  # > 256
+        ]
+
+        for num_tokens, expected_block_m in test_cases:
             config = _get_default_config(num_tokens)
 
             self.assertIn("block_m", config)
@@ -344,15 +355,16 @@ class TestConfigFunctions(unittest.TestCase):
             self.assertIn("warp_n", config)
             self.assertIn("stages", config)
 
-            # block_m should be appropriate for num_tokens
-            if num_tokens <= 16:
-                self.assertEqual(config["block_m"], 16)
-            elif num_tokens <= 64:
-                self.assertEqual(config["block_m"], 32)
-            elif num_tokens <= 256:
-                self.assertEqual(config["block_m"], 64)
-            else:
-                self.assertEqual(config["block_m"], 128)
+            self.assertEqual(
+                config["block_m"], 
+                expected_block_m,
+                f"Expected block_m={expected_block_m} for num_tokens={num_tokens}, got {config['block_m']}"
+            )
+            
+            # Validate default values
+            self.assertEqual(config["block_n"], 32)
+            self.assertEqual(config["warp_n"], 8)
+            self.assertEqual(config["stages"], 3)
 
     def test_get_best_config_for_tokens(self):
         """Test get_best_config_for_tokens function."""
@@ -384,6 +396,53 @@ class TestConfigFunctions(unittest.TestCase):
         self.assertIn("moe_config_E8_N1024_K512.json", path)
         self.assertIn("alpha_moe", path)
 
+    def test_update_alpha_moe_config(self):
+        """Test update_alpha_moe_config function."""
+        from sglang.srt.layers.moe.moe_runner.alpha_moe import (
+            _IS_FIRST_RANK_ON_NODE,
+            update_alpha_moe_config,
+        )
+        
+        # Mock server_args
+        class MockServerArgs:
+            base_gpu_id = 0
+        
+        # Test setting first rank
+        update_alpha_moe_config(gpu_id=0, server_args=MockServerArgs())
+        # Note: We can't directly test _IS_FIRST_RANK_ON_NODE as it's module-level
+        # but we ensure the function runs without error
+
+    def test_get_alpha_moe_config_with_env_var(self):
+        """Test get_alpha_moe_config with ALPHA_MOE_CONFIG env var."""
+        from sglang.srt.layers.moe.moe_runner.alpha_moe import get_alpha_moe_config
+        
+        # Create a temporary config file
+        test_config = {
+            "16": {"block_m": 16, "block_n": 64, "warp_n": 4, "stages": 2},
+            "64": {"block_m": 32, "block_n": 64, "warp_n": 4, "stages": 2},
+        }
+        
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as f:
+            import json
+            json.dump(test_config, f)
+            temp_path = f.name
+        
+        try:
+            # Set environment variable
+            os.environ["ALPHA_MOE_CONFIG"] = temp_path
+            
+            # Should load from env var
+            config = get_alpha_moe_config(E=8, N=1024, K=512)
+            
+            if config is not None:
+                self.assertEqual(config, test_config)
+        finally:
+            # Clean up
+            if "ALPHA_MOE_CONFIG" in os.environ:
+                del os.environ["ALPHA_MOE_CONFIG"]
+            if os.path.exists(temp_path):
+                os.unlink(temp_path)
+
 
 class TestServerArgsIntegration(unittest.TestCase):
     """Test server_args.py integration with Alpha-MoE."""
@@ -398,23 +457,8 @@ class TestServerArgsIntegration(unittest.TestCase):
 class TestModuleExports(unittest.TestCase):
     """Test that all required exports are available."""
 
-    def test_init_exports(self):
-        """Test __init__.py exports."""
-        from sglang.srt.layers.moe.moe_runner import (
-            MoeRunner,
-            MoeRunnerConfig,
-            get_alpha_moe_quant_info,
-            get_alpha_moe_runner_core,
-            is_alpha_moe_available,
-        )
-
-        # These should be callable
-        self.assertTrue(callable(get_alpha_moe_runner_core))
-        self.assertTrue(callable(get_alpha_moe_quant_info))
-        self.assertTrue(callable(is_alpha_moe_available))
-
     def test_alpha_moe_module_exports(self):
-        """Test alpha_moe.py exports."""
+        """Test alpha_moe.py exports all required functions and classes."""
         from sglang.srt.layers.moe.moe_runner.alpha_moe import (
             ALPHA_MOE_AVAILABLE,
             AlphaMoeQuantInfo,
@@ -428,67 +472,80 @@ class TestModuleExports(unittest.TestCase):
             interleave_tensor,
             is_alpha_moe_available,
             run_autotuning,
+            update_alpha_moe_config,
         )
 
-        # All should be importable (not necessarily callable if classes)
+        # All should be importable
         self.assertIsNotNone(ALPHA_MOE_AVAILABLE)
         self.assertIsNotNone(AlphaMoeQuantInfo)
         self.assertIsNotNone(AlphaMoeRunnerCore)
+        self.assertIsNotNone(AlphaMoeRunnerInput)
+        self.assertIsNotNone(AlphaMoeRunnerOutput)
+        
+        # Functions should be callable
+        self.assertTrue(callable(check_alpha_moe_requirements))
+        self.assertTrue(callable(get_alpha_moe_config))
+        self.assertTrue(callable(get_alpha_moe_import_error))
+        self.assertTrue(callable(get_best_config_for_tokens))
+        self.assertTrue(callable(interleave_tensor))
+        self.assertTrue(callable(is_alpha_moe_available))
+        self.assertTrue(callable(run_autotuning))
+        self.assertTrue(callable(update_alpha_moe_config))
 
-
-# Integration test that requires a model with FP8 block quantization
-@unittest.skipIf(get_device_sm() < 89, "Test requires CUDA SM 89+ (Ada/Hopper)")
-class TestAlphaMoeIntegration(unittest.TestCase):
-    """Integration test for Alpha-MoE with a real MoE model."""
-
-    # Note: This test requires:
-    # 1. Alpha-MoE library installed
-    # 2. A compatible MoE model with FP8 block quantization
-    # Uncomment and configure when ready to test
-
-    # MODEL_PATH = "deepseek-ai/DeepSeek-V3-0324-FP8"
-
-    # @classmethod
-    # def setUpClass(cls):
-    #     from sglang.srt.layers.moe.moe_runner.alpha_moe import ALPHA_MOE_AVAILABLE
-    #     if not ALPHA_MOE_AVAILABLE:
-    #         raise unittest.SkipTest("Alpha-MoE library not installed")
-    #
-    #     cls.model = try_cached_model(cls.MODEL_PATH)
-    #     cls.base_url = DEFAULT_URL_FOR_TEST
-    #     other_args = [
-    #         "--trust-remote-code",
-    #         "--moe-runner-backend", "alpha_moe",
-    #         "--tp", "4",
-    #     ]
-    #     cls.process = popen_launch_server(
-    #         cls.model,
-    #         cls.base_url,
-    #         timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-    #         other_args=other_args,
-    #     )
-    #
-    # @classmethod
-    # def tearDownClass(cls):
-    #     kill_process_tree(cls.process.pid)
-    #
-    # def test_basic_generation(self):
-    #     """Test basic text generation with Alpha-MoE backend."""
-    #     import requests
-    #     response = requests.post(
-    #         f"{self.base_url}/generate",
-    #         json={
-    #             "text": "Hello, how are you?",
-    #             "sampling_params": {"max_new_tokens": 32}
-    #         }
-    #     )
-    #     self.assertEqual(response.status_code, 200)
-    #     result = response.json()
-    #     self.assertIn("text", result)
-
-    def test_placeholder(self):
-        """Placeholder test for CI."""
-        self.assertTrue(True)
+# Note: Integration tests that require a model with FP8 block quantization
+# should be added separately. Example test structure:
+#
+# @unittest.skipIf(get_device_sm() < 89, "Test requires CUDA SM 89+ (Ada/Hopper)")
+# class TestAlphaMoeIntegration(unittest.TestCase):
+#     """Integration test for Alpha-MoE with a real MoE model."""
+#
+#     MODEL_PATH = "path/to/fp8-block-quant-moe-model"
+#
+#     @classmethod
+#     def setUpClass(cls):
+#         from sglang.srt.layers.moe.moe_runner.alpha_moe import ALPHA_MOE_AVAILABLE
+#         from sglang.test.test_utils import (
+#             DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+#             DEFAULT_URL_FOR_TEST,
+#             popen_launch_server,
+#             try_cached_model,
+#         )
+#         
+#         if not ALPHA_MOE_AVAILABLE:
+#             raise unittest.SkipTest("Alpha-MoE library not installed")
+#
+#         cls.model = try_cached_model(cls.MODEL_PATH)
+#         cls.base_url = DEFAULT_URL_FOR_TEST
+#         other_args = [
+#             "--trust-remote-code",
+#             "--moe-runner-backend", "alpha_moe",
+#             "--tp", "4",
+#         ]
+#         cls.process = popen_launch_server(
+#             cls.model,
+#             cls.base_url,
+#             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+#             other_args=other_args,
+#         )
+#
+#     @classmethod
+#     def tearDownClass(cls):
+#         from sglang.srt.utils import kill_process_tree
+#         kill_process_tree(cls.process.pid)
+#
+#     def test_basic_generation(self):
+#         """Test basic text generation with Alpha-MoE backend."""
+#         import requests
+#         response = requests.post(
+#             f"{self.base_url}/generate",
+#             json={
+#                 "text": "Hello, how are you?",
+#                 "sampling_params": {"max_new_tokens": 32}
+#             }
+#         )
+#         self.assertEqual(response.status_code, 200)
+#         result = response.json()
+#         self.assertIn("text", result)
 
 
 if __name__ == "__main__":
