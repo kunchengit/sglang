@@ -173,6 +173,7 @@ MOE_RUNNER_BACKEND_CHOICES = [
     "deep_gemm",
     "triton",
     "triton_kernel",
+    "alpha_moe",
     "flashinfer_trtllm",
     "flashinfer_cutlass",
     "flashinfer_mxfp4",
@@ -1945,6 +1946,52 @@ class ServerArgs:
             assert (
                 self.ep_size == 1
             ), "FP8 Cutlass MoE is only supported with ep_size == 1"
+
+        if self.moe_runner_backend == "alpha_moe":
+            # Check if Alpha-MoE is available, fallback to default if not
+            from sglang.srt.layers.moe.moe_runner.alpha_moe import (
+                get_alpha_moe_import_error,
+                is_alpha_moe_available,
+            )
+
+            if not is_alpha_moe_available():
+                import_error = get_alpha_moe_import_error()
+                logger.warning(
+                    f"Alpha-MoE is not installed. Falling back to default MoE backend. "
+                    f"To use Alpha-MoE, install it with: "
+                    f"git clone https://github.com/Aleph-Alpha/Alpha-MoE.git && "
+                    f"cd Alpha-MoE && pip install -e . --no-build-isolation. "
+                    f"Error: {import_error}"
+                )
+                self.moe_runner_backend = "auto"  # Reset to default
+            else:
+                # Alpha-MoE is available, validate other requirements
+                if self.ep_size != 1:
+                    logger.warning(
+                        "Alpha-MoE does not support Expert Parallel (ep_size > 1). "
+                        "Falling back to default MoE backend."
+                    )
+                    self.moe_runner_backend = "auto"
+                elif self.moe_a2a_backend != "none":
+                    logger.warning(
+                        f"Alpha-MoE does not support Expert Parallel ({self.moe_a2a_backend}). "
+                        "Falling back to default MoE backend."
+                    )
+                    self.moe_runner_backend = "auto"
+                elif self.quantization is not None and self.quantization not in (
+                    "fp8",
+                    "compressed-tensors",
+                ):
+                    # Only check if --quantization is explicitly specified and incompatible.
+                    # If --quantization is None, the actual quant method will be auto-detected
+                    # from model config later. If the auto-detected method is not 'fp8' or
+                    # 'compressed-tensors', Alpha-MoE will not be used.
+                    logger.warning(
+                        f"Alpha-MoE only supports 'fp8' or 'compressed-tensors' quantization methods, "
+                        f"but got quantization='{self.quantization}'. "
+                        "Falling back to default MoE backend."
+                    )
+                    self.moe_runner_backend = "auto"
 
     def _handle_a2a_moe(self):
         if self.moe_a2a_backend == "deepep":
