@@ -814,9 +814,7 @@ class CompressedTensorsW8A8Fp8MoEMethod(CompressedTensorsMoEMethod):
         if self.weight_quant.strategy == QuantizationStrategy.BLOCK:
             moe_runner_backend = get_moe_runner_backend()
             if moe_runner_backend.is_alpha_moe():
-                from sglang.srt.layers.moe.moe_runner.alpha_moe import (
-                    interleave_tensor,
-                )
+                from sglang.srt.layers.moe.moe_runner.alpha_moe import interleave_tensor
 
                 # Interleave weights with rep=8, scales with rep=1
                 layer.w13_weight = torch.nn.Parameter(

@@ -19,8 +19,6 @@ import unittest
 
 import torch
 
-from sglang.srt.utils import get_device_sm
-
 
 class TestAlphaMoeAvailability(unittest.TestCase):
     """Test Alpha-MoE library availability detection."""
@@ -218,7 +216,9 @@ class TestRequirementsChecking(unittest.TestCase):
         class MockQuantConfig:
             weight_block_size = [128, 128]
 
-        is_satisfied, error_msg = check_alpha_moe_requirements(quant_config=MockQuantConfig())
+        is_satisfied, error_msg = check_alpha_moe_requirements(
+            quant_config=MockQuantConfig()
+        )
         self.assertTrue(is_satisfied, f"Valid quant_config rejected: {error_msg}")
 
 
@@ -260,8 +260,12 @@ class TestAlphaMoeDataClasses(unittest.TestCase):
         w2_weight = torch.randn(num_experts, hidden_size, intermediate_size // 2).to(
             torch.float8_e4m3fn
         )
-        w13_scale = torch.randn(num_experts, intermediate_size // 128, hidden_size // 128)
-        w2_scale = torch.randn(num_experts, hidden_size // 128, intermediate_size // 256)
+        w13_scale = torch.randn(
+            num_experts, intermediate_size // 128, hidden_size // 128
+        )
+        w2_scale = torch.randn(
+            num_experts, hidden_size // 128, intermediate_size // 256
+        )
 
         quant_info = AlphaMoeQuantInfo(
             w13_weight=w13_weight,
@@ -338,12 +342,12 @@ class TestConfigFunctions(unittest.TestCase):
 
         # Test various batch sizes
         test_cases = [
-            (8, 8),      # <= 64
-            (32, 8),     # <= 64
-            (64, 8),     # <= 64
-            (128, 16),   # <= 256
-            (256, 16),   # <= 256
-            (512, 32),   # > 256
+            (8, 8),  # <= 64
+            (32, 8),  # <= 64
+            (64, 8),  # <= 64
+            (128, 16),  # <= 256
+            (256, 16),  # <= 256
+            (512, 32),  # > 256
             (1024, 32),  # > 256
         ]
 
@@ -356,11 +360,11 @@ class TestConfigFunctions(unittest.TestCase):
             self.assertIn("stages", config)
 
             self.assertEqual(
-                config["block_m"], 
+                config["block_m"],
                 expected_block_m,
-                f"Expected block_m={expected_block_m} for num_tokens={num_tokens}, got {config['block_m']}"
+                f"Expected block_m={expected_block_m} for num_tokens={num_tokens}, got {config['block_m']}",
             )
-            
+
             # Validate default values
             self.assertEqual(config["block_n"], 32)
             self.assertEqual(config["warp_n"], 8)
@@ -368,7 +372,9 @@ class TestConfigFunctions(unittest.TestCase):
 
     def test_get_best_config_for_tokens(self):
         """Test get_best_config_for_tokens function."""
-        from sglang.srt.layers.moe.moe_runner.alpha_moe import get_best_config_for_tokens
+        from sglang.srt.layers.moe.moe_runner.alpha_moe import (
+            get_best_config_for_tokens,
+        )
 
         # Test with None config (should return default)
         config = get_best_config_for_tokens(None, 64)
@@ -398,15 +404,12 @@ class TestConfigFunctions(unittest.TestCase):
 
     def test_update_alpha_moe_config(self):
         """Test update_alpha_moe_config function."""
-        from sglang.srt.layers.moe.moe_runner.alpha_moe import (
-            _IS_FIRST_RANK_ON_NODE,
-            update_alpha_moe_config,
-        )
-        
+        from sglang.srt.layers.moe.moe_runner.alpha_moe import update_alpha_moe_config
+
         # Mock server_args
         class MockServerArgs:
             base_gpu_id = 0
-        
+
         # Test setting first rank
         update_alpha_moe_config(gpu_id=0, server_args=MockServerArgs())
         # Note: We can't directly test _IS_FIRST_RANK_ON_NODE as it's module-level
@@ -415,25 +418,26 @@ class TestConfigFunctions(unittest.TestCase):
     def test_get_alpha_moe_config_with_env_var(self):
         """Test get_alpha_moe_config with ALPHA_MOE_CONFIG env var."""
         from sglang.srt.layers.moe.moe_runner.alpha_moe import get_alpha_moe_config
-        
+
         # Create a temporary config file
         test_config = {
             "16": {"block_m": 16, "block_n": 64, "warp_n": 4, "stages": 2},
             "64": {"block_m": 32, "block_n": 64, "warp_n": 4, "stages": 2},
         }
-        
-        with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as f:
+
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
             import json
+
             json.dump(test_config, f)
             temp_path = f.name
-        
+
         try:
             # Set environment variable
             os.environ["ALPHA_MOE_CONFIG"] = temp_path
-            
+
             # Should load from env var
             config = get_alpha_moe_config(E=8, N=1024, K=512)
-            
+
             if config is not None:
                 self.assertEqual(config, test_config)
         finally:
@@ -481,7 +485,7 @@ class TestModuleExports(unittest.TestCase):
         self.assertIsNotNone(AlphaMoeRunnerCore)
         self.assertIsNotNone(AlphaMoeRunnerInput)
         self.assertIsNotNone(AlphaMoeRunnerOutput)
-        
+
         # Functions should be callable
         self.assertTrue(callable(check_alpha_moe_requirements))
         self.assertTrue(callable(get_alpha_moe_config))
@@ -491,6 +495,7 @@ class TestModuleExports(unittest.TestCase):
         self.assertTrue(callable(is_alpha_moe_available))
         self.assertTrue(callable(run_autotuning))
         self.assertTrue(callable(update_alpha_moe_config))
+
 
 # Note: Integration tests that require a model with FP8 block quantization
 # should be added separately. Example test structure:
@@ -510,7 +515,7 @@ class TestModuleExports(unittest.TestCase):
 #             popen_launch_server,
 #             try_cached_model,
 #         )
-#         
+#
 #         if not ALPHA_MOE_AVAILABLE:
 #             raise unittest.SkipTest("Alpha-MoE library not installed")
 #

@@ -9,11 +9,11 @@ This module provides integration of Alpha-MoE into SGLang's MoE runner framework
 
 from __future__ import annotations
 
+import importlib.util
 import json
 import logging
 import os
 from dataclasses import dataclass
-from pathlib import Path
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
 import torch
@@ -66,15 +66,12 @@ def update_alpha_moe_config(gpu_id: int, server_args) -> None:
 # Alpha-MoE Availability Check
 # ============================================================================
 
-ALPHA_MOE_AVAILABLE = False
-_alpha_moe_import_error: Optional[Exception] = None
-
-try:
-    import alpha_moe
-
-    ALPHA_MOE_AVAILABLE = True
-except ImportError as e:
-    _alpha_moe_import_error = e
+# Check availability of Alpha-MoE package
+_alpha_moe_spec = importlib.util.find_spec("alpha_moe")
+ALPHA_MOE_AVAILABLE = _alpha_moe_spec is not None
+_alpha_moe_import_error: Optional[Exception] = (
+    None if ALPHA_MOE_AVAILABLE else ImportError("alpha_moe module not found")
+)
 
 
 def is_alpha_moe_available() -> bool:
@@ -158,8 +155,7 @@ def check_alpha_moe_requirements(
     # This is a secondary runtime check for robustness.
     if not ALPHA_MOE_AVAILABLE:
         return False, (
-            f"Alpha-MoE is not installed. "
-            f"Error: {_alpha_moe_import_error}"
+            f"Alpha-MoE is not installed. " f"Error: {_alpha_moe_import_error}"
         )
 
     # Check 2: Not in EP mode (runtime double-check, primary validation in server_args.py)
@@ -216,7 +212,9 @@ _ALPHA_MOE_CACHE_DIR = os.path.join(
     os.path.expanduser("~"), ".cache", "sglang", "alpha_moe"
 )
 _ALPHA_MOE_CONFIG_CACHE: Dict[str, dict] = {}
-_ALPHA_MOE_AUTOTUNING_DONE: Dict[str, bool] = {}  # Track if autotuning was already attempted
+_ALPHA_MOE_AUTOTUNING_DONE: Dict[str, bool] = (
+    {}
+)  # Track if autotuning was already attempted
 
 
 def _get_config_cache_path(E: int, N: int, K: int) -> str:
@@ -274,10 +272,10 @@ def run_autotuning(
             f"Will use default config. Config will be cached by first rank."
         )
         return None
-    
+
     # First rank on node: Run autotuning
     os.makedirs(_ALPHA_MOE_CACHE_DIR, exist_ok=True)
-    
+
     logger.info(
         f"Running Alpha-MoE autotuning for E={E}, N={N}, K={K}, top_k={top_k}. "
         "This may take a few minutes on first run..."
@@ -300,12 +298,12 @@ def run_autotuning(
     )
     w2_scale = (
         torch.randn(
-                (E, K // block_shape[0], (N // 2) // block_shape[1]),
-                dtype=torch.float32,
-                device=device,
-            )
-            * 0.01
+            (E, K // block_shape[0], (N // 2) // block_shape[1]),
+            dtype=torch.float32,
+            device=device,
         )
+        * 0.01
+    )
 
     # Interleave w1 weights and scales
     w1_interleaved = interleave_tensor(w1, rep=8)
@@ -480,9 +478,13 @@ def get_alpha_moe_config(
                 config = json.load(f)
                 _ALPHA_MOE_CONFIG_CACHE[cache_path] = config
                 if _IS_FIRST_RANK_ON_NODE:
-                    logger.info(f"Loaded Alpha-MoE config from disk cache: {cache_path}")
+                    logger.info(
+                        f"Loaded Alpha-MoE config from disk cache: {cache_path}"
+                    )
                 else:
-                    logger.debug(f"Loaded Alpha-MoE config from disk cache: {cache_path}")
+                    logger.debug(
+                        f"Loaded Alpha-MoE config from disk cache: {cache_path}"
+                    )
                 return config
         except Exception:
             pass
@@ -495,9 +497,13 @@ def get_alpha_moe_config(
                 config = json.load(f)
                 _ALPHA_MOE_CONFIG_CACHE[cache_path] = config
                 if _IS_FIRST_RANK_ON_NODE:
-                    logger.info(f"Loaded Alpha-MoE config from user config: {user_config_path}")
+                    logger.info(
+                        f"Loaded Alpha-MoE config from user config: {user_config_path}"
+                    )
                 else:
-                    logger.debug(f"Loaded Alpha-MoE config from user config: {user_config_path}")
+                    logger.debug(
+                        f"Loaded Alpha-MoE config from user config: {user_config_path}"
+                    )
                 return config
         except Exception:
             pass
@@ -521,7 +527,9 @@ def get_alpha_moe_config(
     return None
 
 
-def get_best_config_for_tokens(config: Optional[Dict[str, dict]], num_tokens: int) -> dict:
+def get_best_config_for_tokens(
+    config: Optional[Dict[str, dict]], num_tokens: int
+) -> dict:
     """
     Get the best kernel configuration for a given number of tokens.
 
@@ -586,7 +594,7 @@ class AlphaMoeRunnerOutput(RunnerOutput):
 class AlphaMoeQuantInfo(MoeQuantInfo):
     """Quantization info for Alpha-MoE.
 
-    Only requires weights and scales. 
+    Only requires weights and scales.
     block_shape is always [128, 128] for Alpha-MoE.
     """
 
@@ -656,7 +664,9 @@ class AlphaMoeRunnerCore(MoeRunnerCore):
         Returns:
             AlphaMoeRunnerOutput with computed hidden states
         """
-        from sglang.srt.layers.moe.fused_moe_triton.fused_moe import moe_align_block_size
+        from sglang.srt.layers.moe.fused_moe_triton.fused_moe import (
+            moe_align_block_size,
+        )
 
         # Lazy load tuning config on first execution (similar to DeepGEMM pattern)
         # get_alpha_moe_config handles: read cache -> check if tuned -> tune if needed
@@ -741,7 +751,7 @@ def standard_to_alpha_moe_pre_permute(
 ) -> AlphaMoeRunnerInput:
     """
     Convert standard dispatch output to Alpha-MoE runner input.
-    
+
     Note: This function only does FP8 quantization. The moe_align_block_size
     is done in AlphaMoeRunnerCore.run() after autotuning determines block_m.
     """

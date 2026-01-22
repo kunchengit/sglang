@@ -867,9 +867,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
 
             # Alpha-MoE: interleave weights and scales for the kernel
             if get_moe_runner_backend().is_alpha_moe():
-                from sglang.srt.layers.moe.moe_runner.alpha_moe import (
-                    interleave_tensor,
-                )
+                from sglang.srt.layers.moe.moe_runner.alpha_moe import interleave_tensor
 
                 # Interleave weights with rep=8, scales with rep=1
                 layer.w13_weight = torch.nn.Parameter(

@@ -1950,8 +1950,8 @@ class ServerArgs:
         if self.moe_runner_backend == "alpha_moe":
             # Check if Alpha-MoE is available, fallback to default if not
             from sglang.srt.layers.moe.moe_runner.alpha_moe import (
-                is_alpha_moe_available,
                 get_alpha_moe_import_error,
+                is_alpha_moe_available,
             )
 
             if not is_alpha_moe_available():
@@ -1978,7 +1978,10 @@ class ServerArgs:
                         "Falling back to default MoE backend."
                     )
                     self.moe_runner_backend = "auto"
-                elif self.quantization is not None and self.quantization not in ("fp8", "compressed-tensors"):
+                elif self.quantization is not None and self.quantization not in (
+                    "fp8",
+                    "compressed-tensors",
+                ):
                     # Only check if --quantization is explicitly specified and incompatible.
                     # If --quantization is None, the actual quant method will be auto-detected
                     # from model config later, and checked in AlphaMoeRunnerCore.__init__
@@ -1988,7 +1991,6 @@ class ServerArgs:
                         "Falling back to default MoE backend."
                     )
                     self.moe_runner_backend = "auto"
-                
 
     def _handle_a2a_moe(self):
         if self.moe_a2a_backend == "deepep":
