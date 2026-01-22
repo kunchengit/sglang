@@ -879,8 +879,6 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                     requires_grad=False,
                 )
                 torch.cuda.empty_cache()
-                # NOTE: Autotuning is lazily triggered during the first kernel execution
-                # in AlphaMoeRunnerCore.run(), similar to DeepGEMM's JIT compilation pattern.
 
     def process_weights_after_loading(self, layer: Module) -> None:
         if _is_hip and _use_hip_int4:

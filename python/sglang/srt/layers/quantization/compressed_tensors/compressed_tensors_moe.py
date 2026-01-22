@@ -826,8 +826,6 @@ class CompressedTensorsW8A8Fp8MoEMethod(CompressedTensorsMoEMethod):
                     requires_grad=False,
                 )
                 torch.cuda.empty_cache()
-                # NOTE: Autotuning is lazily triggered during the first kernel execution
-                # in AlphaMoeRunnerCore.run(), similar to DeepGEMM's JIT compilation pattern.
 
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig

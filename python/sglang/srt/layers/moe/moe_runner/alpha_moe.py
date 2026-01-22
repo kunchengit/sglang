@@ -9,7 +9,6 @@ This module provides integration of Alpha-MoE into SGLang's MoE runner framework
 
 from __future__ import annotations
 
-import importlib.util
 import json
 import logging
 import os
@@ -37,10 +36,6 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# ============================================================================
-# Global Configuration (similar to DeepGEMM's compile_utils.py pattern)
-# ============================================================================
-
 # Controls which rank runs autotuning. Similar to DeepGEMM's _IS_FIRST_RANK_ON_NODE.
 # - True: This rank should run autotuning (default for single GPU)
 # - False: This rank should wait and load from cache
@@ -62,16 +57,15 @@ def update_alpha_moe_config(gpu_id: int, server_args) -> None:
     _IS_FIRST_RANK_ON_NODE = server_args.base_gpu_id == gpu_id
 
 
-# ============================================================================
 # Alpha-MoE Availability Check
-# ============================================================================
 
-# Check availability of Alpha-MoE package
-_alpha_moe_spec = importlib.util.find_spec("alpha_moe")
-ALPHA_MOE_AVAILABLE = _alpha_moe_spec is not None
-_alpha_moe_import_error: Optional[Exception] = (
-    None if ALPHA_MOE_AVAILABLE else ImportError("alpha_moe module not found")
-)
+try:
+    # Must actually import to register torch.ops.alpha_moe operators
+    import alpha_moe  # noqa: F401
+
+    ALPHA_MOE_AVAILABLE = True
+except ImportError as e:
+    _alpha_moe_import_error = e
 
 
 def is_alpha_moe_available() -> bool:
@@ -84,9 +78,7 @@ def get_alpha_moe_import_error() -> Optional[Exception]:
     return _alpha_moe_import_error
 
 
-# ============================================================================
 # Weight Interleaving Utilities
-# ============================================================================
 
 
 def interleave_tensor(tensor: torch.Tensor, rep: int = 8) -> torch.Tensor:
@@ -117,9 +109,7 @@ def interleave_tensor(tensor: torch.Tensor, rep: int = 8) -> torch.Tensor:
     return result.contiguous()
 
 
-# ============================================================================
 # Requirements Checking
-# ============================================================================
 
 
 def check_alpha_moe_requirements(
@@ -204,9 +194,7 @@ def check_alpha_moe_requirements(
     return True, ""
 
 
-# ============================================================================
 # JIT Autotuning and Configuration
-# ============================================================================
 
 _ALPHA_MOE_CACHE_DIR = os.path.join(
     os.path.expanduser("~"), ".cache", "sglang", "alpha_moe"
@@ -285,7 +273,6 @@ def run_autotuning(
     batch_sizes = [1, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096]
 
     # Create dummy weights for tuning
-    # Note: torch.randn doesn't support FP8 dtype directly, must create and convert
     w1 = torch.randn((E, N, K), device=device).to(torch.float8_e4m3fn)
     w2 = torch.randn((E, K, N // 2), device=device).to(torch.float8_e4m3fn)
     w1_scale = (
@@ -558,9 +545,7 @@ def get_best_config_for_tokens(
     return config[best_key]
 
 
-# ============================================================================
 # Runner Data Classes
-# ============================================================================
 
 
 @dataclass
@@ -571,8 +556,6 @@ class AlphaMoeRunnerInput(RunnerInput):
     hidden_states_scale: torch.Tensor  # Input scale
     topk_weights: torch.Tensor  # [M, top_k]
     topk_ids: torch.Tensor  # [M, top_k]
-    # Note: sorted_token_ids, expert_ids, num_tokens_post_padded are computed
-    # in run() after autotuning determines block_m, not in pre_permute
 
     @property
     def runner_backend(self) -> MoeRunnerBackend:
@@ -624,9 +607,7 @@ class AlphaMoeQuantInfo(MoeQuantInfo):
         return [128, 128]
 
 
-# ============================================================================
 # Alpha-MoE Runner Core
-# ============================================================================
 
 
 class AlphaMoeRunnerCore(MoeRunnerCore):
@@ -668,7 +649,7 @@ class AlphaMoeRunnerCore(MoeRunnerCore):
             moe_align_block_size,
         )
 
-        # Lazy load tuning config on first execution (similar to DeepGEMM pattern)
+        # Lazy load tuning config on first execution
         # get_alpha_moe_config handles: read cache -> check if tuned -> tune if needed
         if self._tuning_config is None:
             self._tuning_config = get_alpha_moe_config(
@@ -737,9 +718,7 @@ class AlphaMoeRunnerCore(MoeRunnerCore):
         return AlphaMoeRunnerOutput(hidden_states=output)
 
 
-# ============================================================================
 # Pre/Post Permute Functions for Dispatcher Integration
-# ============================================================================
 
 
 @register_pre_permute("standard", "alpha_moe")

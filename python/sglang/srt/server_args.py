@@ -1984,7 +1984,8 @@ class ServerArgs:
                 ):
                     # Only check if --quantization is explicitly specified and incompatible.
                     # If --quantization is None, the actual quant method will be auto-detected
-                    # from model config later, and checked in AlphaMoeRunnerCore.__init__
+                    # from model config later. If the auto-detected method is not 'fp8' or
+                    # 'compressed-tensors', Alpha-MoE will not be used.
                     logger.warning(
                         f"Alpha-MoE only supports 'fp8' or 'compressed-tensors' quantization methods, "
                         f"but got quantization='{self.quantization}'. "
