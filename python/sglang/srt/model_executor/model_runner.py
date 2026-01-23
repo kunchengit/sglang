@@ -351,6 +351,14 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM:
             deep_gemm_wrapper.update_deep_gemm_config(gpu_id, server_args)
 
+        # Update Alpha-MoE configure if choose Alpha-MoE backend
+        if server_args.moe_runner_backend == "alpha_moe":
+            from sglang.srt.layers.moe.moe_runner.alpha_moe import (
+                update_alpha_moe_config,
+            )
+
+            update_alpha_moe_config(gpu_id, server_args)
+
         # Initialize the model runner
         self.initialize(min_per_gpu_memory)
         self.check_quantized_moe_compatibility()

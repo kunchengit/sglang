@@ -831,6 +831,24 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                     )
                     layer.w13_weight_scale_inv.format_ue8m0 = True
                     layer.w2_weight_scale_inv.format_ue8m0 = True
+
+                # Alpha-MoE: interleave weights and scales for the kernel
+                if get_moe_runner_backend().is_alpha_moe():
+                    from sglang.srt.layers.moe.moe_runner.alpha_moe import (
+                        interleave_tensor,
+                    )
+
+                    # Interleave weights with rep=8, scales with rep=1
+                    layer.w13_weight = torch.nn.Parameter(
+                        interleave_tensor(layer.w13_weight.data, rep=8),
+                        requires_grad=False,
+                    )
+                    layer.w13_weight_scale_inv = torch.nn.Parameter(
+                        interleave_tensor(layer.w13_weight_scale_inv.data, rep=1),
+                        requires_grad=False,
+                    )
+                    torch.cuda.empty_cache()
+
             return
 
         # If checkpoint is fp16 or bfloat16, quantize in place.
@@ -1119,7 +1137,21 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 moe_runner_backend = MoeRunnerBackend.DEEP_GEMM
             else:
                 moe_runner_backend = MoeRunnerBackend.TRITON
-        if moe_runner_backend.is_deep_gemm() or moe_runner_backend.is_triton():
+        if moe_runner_backend.is_alpha_moe():
+            # Alpha-MoE: validate requirements before creating runner
+            from sglang.srt.layers.moe.moe_runner.alpha_moe import (
+                check_alpha_moe_requirements,
+            )
+
+            is_satisfied, error_msg = check_alpha_moe_requirements(
+                block_size=self.quant_config.weight_block_size,
+                is_block_quant=self.block_quant,
+                layer=layer,
+            )
+            if not is_satisfied:
+                raise ValueError(f"Alpha-MoE requirements not satisfied: {error_msg}")
+            self.runner = MoeRunner(moe_runner_backend, moe_runner_config)
+        elif moe_runner_backend.is_deep_gemm() or moe_runner_backend.is_triton():
             self.runner = MoeRunner(moe_runner_backend, moe_runner_config)
         else:
             # TODO(cwan): refactor other backends
@@ -1263,6 +1295,15 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 a13_scale=layer.w13_input_scale,
                 a2_scale=layer.w2_input_scale,
                 block_shape=self.quant_config.weight_block_size,
+            )
+        elif self.runner.runner_backend.is_alpha_moe():
+            from sglang.srt.layers.moe.moe_runner.alpha_moe import AlphaMoeQuantInfo
+
+            quant_info = AlphaMoeQuantInfo(
+                w13_weight=layer.w13_weight,
+                w2_weight=layer.w2_weight,
+                w13_scale=layer.w13_weight_scale_inv,
+                w2_scale=layer.w2_weight_scale_inv,
             )
         else:
             raise NotImplementedError(

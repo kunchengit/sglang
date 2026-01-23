@@ -774,11 +774,49 @@ class CompressedTensorsW8A8Fp8MoEMethod(CompressedTensorsMoEMethod):
                 )
                 torch.cuda.empty_cache()
 
+        # Alpha-MoE: interleave weights and scales for the kernel
+        if self.weight_quant.strategy == QuantizationStrategy.BLOCK:
+            moe_runner_backend = get_moe_runner_backend()
+            if moe_runner_backend.is_alpha_moe():
+                from sglang.srt.layers.moe.moe_runner.alpha_moe import interleave_tensor
+
+                # Interleave weights with rep=8, scales with rep=1
+                layer.w13_weight = torch.nn.Parameter(
+                    interleave_tensor(layer.w13_weight.data, rep=8),
+                    requires_grad=False,
+                )
+                layer.w13_weight_scale = torch.nn.Parameter(
+                    interleave_tensor(layer.w13_weight_scale.data, rep=1),
+                    requires_grad=False,
+                )
+                torch.cuda.empty_cache()
+
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
     ):
         self.moe_runner_config = moe_runner_config
-        self.runner = MoeRunner(MoeRunnerBackend.TRITON, moe_runner_config)
+        moe_runner_backend = get_moe_runner_backend()
+
+        # Handle auto backend selection
+        if moe_runner_backend.is_auto():
+            moe_runner_backend = MoeRunnerBackend.TRITON
+
+        # Handle Alpha-MoE backend
+        if moe_runner_backend.is_alpha_moe():
+            from sglang.srt.layers.moe.moe_runner.alpha_moe import (
+                check_alpha_moe_requirements,
+            )
+
+            is_satisfied, error_msg = check_alpha_moe_requirements(
+                block_size=self.weight_block_size,
+                is_block_quant=self.block_quant,
+                layer=layer,
+            )
+            if not is_satisfied:
+                raise ValueError(f"Alpha-MoE requirements not satisfied: {error_msg}")
+            self.runner = MoeRunner(moe_runner_backend, moe_runner_config)
+        else:
+            self.runner = MoeRunner(MoeRunnerBackend.TRITON, moe_runner_config)
 
     def apply(
         self,
@@ -827,16 +865,27 @@ class CompressedTensorsW8A8Fp8MoEMethod(CompressedTensorsMoEMethod):
             )
             return StandardCombineInput(hidden_states=output)
         elif self.weight_quant.strategy == QuantizationStrategy.BLOCK:
-            quant_info = TritonMoeQuantInfo(
-                w13_weight=layer.w13_weight,
-                w2_weight=layer.w2_weight,
-                use_fp8_w8a8=True,
-                w13_scale=layer.w13_weight_scale,
-                w2_scale=layer.w2_weight_scale,
-                a13_scale=layer.w13_input_scale,
-                a2_scale=layer.w2_input_scale,
-                block_shape=self.weight_block_size,
-            )
+            # Check if using Alpha-MoE backend
+            if self.runner.runner_backend.is_alpha_moe():
+                from sglang.srt.layers.moe.moe_runner.alpha_moe import AlphaMoeQuantInfo
+
+                quant_info = AlphaMoeQuantInfo(
+                    w13_weight=layer.w13_weight,
+                    w2_weight=layer.w2_weight,
+                    w13_scale=layer.w13_weight_scale,
+                    w2_scale=layer.w2_weight_scale,
+                )
+            else:
+                quant_info = TritonMoeQuantInfo(
+                    w13_weight=layer.w13_weight,
+                    w2_weight=layer.w2_weight,
+                    use_fp8_w8a8=True,
+                    w13_scale=layer.w13_weight_scale,
+                    w2_scale=layer.w2_weight_scale,
+                    a13_scale=layer.w13_input_scale,
+                    a2_scale=layer.w2_input_scale,
+                    block_shape=self.weight_block_size,
+                )
             return self.runner.run(dispatch_output, quant_info)
         else:
             quant_info = TritonMoeQuantInfo(
